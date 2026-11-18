@@ -1,0 +1,100 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "ac.grim.grimac",
+    "module": "grim-internal-shims",
+    "version": "1.6.0.13-fix_atomic-ownership-20261117-92612aa",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14.4"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "url": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "size": 892,
+          "sha512": "d2dd7140983ab5529987bfce3d1e813dda36028549911b6673213854344823fcb21d2315fb901887278b287a6a0a86c14cd239993d38e02abc2e96d01703ced4",
+          "sha256": "2e70be5e2de0c99b10f7e690b790ba6388f2bf834b4ede3cb4716791cb9d5410",
+          "sha1": "bd32bb6878acae35d7e1ed0d4485b3363953108a",
+          "md5": "006d2eb908a9536fdf429e62a3280771"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "url": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "size": 892,
+          "sha512": "d2dd7140983ab5529987bfce3d1e813dda36028549911b6673213854344823fcb21d2315fb901887278b287a6a0a86c14cd239993d38e02abc2e96d01703ced4",
+          "sha256": "2e70be5e2de0c99b10f7e690b790ba6388f2bf834b4ede3cb4716791cb9d5410",
+          "sha1": "bd32bb6878acae35d7e1ed0d4485b3363953108a",
+          "md5": "006d2eb908a9536fdf429e62a3280771"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa-sources.jar",
+          "url": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa-sources.jar",
+          "size": 862,
+          "sha512": "615e25988a6cbb95d34a0a815e52ba88bb171f9d4b0079e704ec6820758ae1cae68750a23aea14f9d39c32c42fbbed6e95e20aaa2482fdd4a192b6b3634b11c5",
+          "sha256": "937136dd26dbba8687640bb0f5f0d02e0a4d2cb27323616f8f5bc5db008733d2",
+          "sha1": "97ddd54ea9fe2f2a3559328237c84b508bc0b4bc",
+          "md5": "81149beabff530de489eeff610afaa9c"
+        }
+      ]
+    },
+    {
+      "name": "javadocElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "javadoc",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa-javadoc.jar",
+          "url": "grim-internal-shims-1.6.0.13-fix_atomic-ownership-20261117-92612aa-javadoc.jar",
+          "size": 84016,
+          "sha512": "24b533aebf353ecb713bd5fe71f65283a84c254446ffdf344afa7bf2b5689ec1a8386b7536d13e76ee6033fa3139cd8d937a2afc8048d33282bbdc99aef32f48",
+          "sha256": "31714877ce5113174510673fc0198d7a6768d113c0da13b7c2eaf9988ca172aa",
+          "sha1": "801b45988d9114814e3b76002205a6383bde0a5f",
+          "md5": "60df9f092c945d1c726982a0df9a1705"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "ac.grim.grimac",
+    "module": "grim-fabric-internal",
+    "version": "1.6.0.13-fix_atomic-ownership-20261117-92612aa",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14.4"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "ac.grim.grimac",
+          "module": "GrimAPI",
+          "version": {
+            "requires": "1.6.0.13-fix_atomic-ownership-20261117-92612aa"
+          }
+        },
+        {
+          "group": "ac.grim.grimac",
+          "module": "grim-internal",
+          "version": {
+            "requires": "1.6.0.13-fix_atomic-ownership-20261117-92612aa"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "url": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "size": 261,
+          "sha512": "ac06e2cfd4dbcacbd7cf9aa45d063091e1a7710209b0c0a51fb201b34ca3db881b9c96a1939e63798d2236c3b629556d928878da810e884c44e1bac5f36bb88c",
+          "sha256": "b94e3e1d972291795ac001aaf1748f48da02bfc266268729a04830124ec4e1b2",
+          "sha1": "b07519334726325ccdfb78d8fbc8347488532e22",
+          "md5": "b3d60f2e8c0b94f476a96b5f5d073a8e"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "ac.grim.grimac",
+          "module": "GrimAPI",
+          "version": {
+            "requires": "1.6.0.13-fix_atomic-ownership-20261117-92612aa"
+          }
+        },
+        {
+          "group": "ac.grim.grimac",
+          "module": "grim-internal",
+          "version": {
+            "requires": "1.6.0.13-fix_atomic-ownership-20261117-92612aa"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "url": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa.jar",
+          "size": 261,
+          "sha512": "ac06e2cfd4dbcacbd7cf9aa45d063091e1a7710209b0c0a51fb201b34ca3db881b9c96a1939e63798d2236c3b629556d928878da810e884c44e1bac5f36bb88c",
+          "sha256": "b94e3e1d972291795ac001aaf1748f48da02bfc266268729a04830124ec4e1b2",
+          "sha1": "b07519334726325ccdfb78d8fbc8347488532e22",
+          "md5": "b3d60f2e8c0b94f476a96b5f5d073a8e"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa-sources.jar",
+          "url": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa-sources.jar",
+          "size": 261,
+          "sha512": "ac06e2cfd4dbcacbd7cf9aa45d063091e1a7710209b0c0a51fb201b34ca3db881b9c96a1939e63798d2236c3b629556d928878da810e884c44e1bac5f36bb88c",
+          "sha256": "b94e3e1d972291795ac001aaf1748f48da02bfc266268729a04830124ec4e1b2",
+          "sha1": "b07519334726325ccdfb78d8fbc8347488532e22",
+          "md5": "b3d60f2e8c0b94f476a96b5f5d073a8e"
+        }
+      ]
+    },
+    {
+      "name": "javadocElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "javadoc",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa-javadoc.jar",
+          "url": "grim-fabric-internal-1.6.0.13-fix_atomic-ownership-20261117-92612aa-javadoc.jar",
+          "size": 261,
+          "sha512": "ac06e2cfd4dbcacbd7cf9aa45d063091e1a7710209b0c0a51fb201b34ca3db881b9c96a1939e63798d2236c3b629556d928878da810e884c44e1bac5f36bb88c",
+          "sha256": "b94e3e1d972291795ac001aaf1748f48da02bfc266268729a04830124ec4e1b2",
+          "sha1": "b07519334726325ccdfb78d8fbc8347488532e22",
+          "md5": "b3d60f2e8c0b94f476a96b5f5d073a8e"
+        }
+      ]
+    }
+  ]
+}
