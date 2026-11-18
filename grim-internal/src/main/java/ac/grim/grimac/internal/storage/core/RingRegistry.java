@@ -93,7 +93,10 @@ public final class RingRegistry {
             @NotNull KindAdapter adapter,
             @NotNull StoreId storeId,
             @NotNull DataKind kind) throws BackendException {
-        StorageEventHandler<E> handler = adapter.writeHandler(storeId, kind, cat);
+        register(cat, backend, adapter.writeHandler(storeId, kind, cat));
+    }
+
+    <E> void register(Category<E> cat, BackendV2 backend, StorageEventHandler<E> handler) throws BackendException {
         if (usesSharedSingleWriter(backend, cat)) {
             // Wrap the handler to submit work to a shared single-thread
             // executor per backend. The Disruptor thread does the fast

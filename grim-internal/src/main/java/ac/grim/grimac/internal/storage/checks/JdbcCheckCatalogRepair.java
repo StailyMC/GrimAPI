@@ -1,6 +1,7 @@
 package ac.grim.grimac.internal.storage.checks;
 
 import ac.grim.grimac.api.storage.check.CheckCatalogRepairResult;
+import ac.grim.grimac.api.storage.check.CheckCatalogRow;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -27,18 +28,51 @@ public final class JdbcCheckCatalogRepair {
             boolean autoCommit = c.getAutoCommit();
             c.setAutoCommit(false);
             try {
-                long violationsUpdated = rewriteViolationIds(c, violationsTable, legacyToCatalogCheckIds);
-                long versionsUpdated = repairStubVersions(c, checksTable, introducedVersionReplacement);
+                CheckCatalogRepairResult result = run(c, checksTable, violationsTable, legacyToCatalogCheckIds,
+                        introducedVersionReplacement);
                 c.commit();
-                return new CheckCatalogRepairResult(
-                        legacyToCatalogCheckIds.size(),
-                        violationsUpdated,
-                        versionsUpdated);
+                return result;
             } catch (SQLException | RuntimeException e) {
                 try { c.rollback(); } catch (SQLException ignored) {}
                 throw e;
             } finally {
                 try { c.setAutoCommit(autoCommit); } catch (SQLException ignored) {}
+            }
+        }
+    }
+
+    /** All statements use the caller's transaction, including its ownership check and rollback. */
+    public static CheckCatalogRepairResult run(Connection c, String checksTable, String violationsTable,
+            Map<Integer, Integer> mappings, @Nullable String replacement) throws SQLException {
+        return new CheckCatalogRepairResult(mappings.size(), rewriteViolationIds(c, violationsTable, mappings),
+                repairStubVersions(c, checksTable, replacement));
+    }
+
+    /** Apply prewarm inserts and display renames to the same snapshot used to plan the repair. */
+    public static void applyPrewarm(Connection c, String checksTable, Map<String, CheckCatalogRow> before,
+                                    Iterable<CheckCatalogRow> after) throws SQLException {
+        try (PreparedStatement insert = c.prepareStatement("INSERT INTO " + checksTable
+                    + " (check_id, stable_key, display, description, introduced_version, introduced_at) VALUES (?, ?, ?, ?, ?, ?)");
+             PreparedStatement rename = c.prepareStatement("UPDATE " + checksTable
+                    + " SET display = ?, description = ? WHERE stable_key = ? AND check_id = ?")) {
+            for (CheckCatalogRow row : after) {
+                CheckCatalogRow old = before.get(row.stableKey());
+                if (row.equals(old)) continue;
+                if (old == null) {
+                    insert.setInt(1, row.checkId());
+                    insert.setString(2, row.stableKey());
+                    insert.setString(3, row.display());
+                    insert.setString(4, row.description());
+                    insert.setString(5, row.introducedVersion());
+                    insert.setLong(6, row.introducedAt());
+                    insert.executeUpdate();
+                } else {
+                    rename.setString(1, row.display());
+                    rename.setString(2, row.description());
+                    rename.setString(3, old.stableKey());
+                    rename.setInt(4, old.checkId());
+                    if (rename.executeUpdate() != 1) throw new SQLException("Catalog changed during prewarm: " + old.stableKey());
+                }
             }
         }
     }

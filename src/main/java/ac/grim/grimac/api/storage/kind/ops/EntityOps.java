@@ -31,7 +31,8 @@ public final class EntityOps {
      * move; a row already owned by {@code startupId} is left untouched, including
      * its closure. Returns 1 if moved, 0 if missing, already moved or conflicting.
      * Callers must hold the new server lease and prove the connection is still
-     * alive in memory. Ordinary heartbeats must never use this operation.
+     * alive in memory. Enforced callers use ServerOwnershipAdapter.reassignSession so the destination
+     * lease is checked in the move itself. Ordinary heartbeats must never use this operation.
      */
     public record ReassignSessionOp(
             @NotNull Category<?> category,

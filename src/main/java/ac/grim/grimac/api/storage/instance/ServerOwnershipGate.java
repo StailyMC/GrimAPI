@@ -36,7 +36,7 @@ public final class ServerOwnershipGate {
         return enforced;
     }
 
-    public void open(@NotNull UUID startupId, @NotNull UUID fence, long ttlMs, long safetyMarginMs) {
+    public synchronized void open(@NotNull UUID startupId, @NotNull UUID fence, long ttlMs, long safetyMarginMs) {
         if (!enforced) return;
         this.startupId = startupId;
         this.fence = fence;
@@ -45,7 +45,7 @@ public final class ServerOwnershipGate {
         this.open = true;
     }
 
-    public void extend(@NotNull UUID startupId, @NotNull UUID fence, long ttlMs, long safetyMarginMs) {
+    public synchronized void extend(@NotNull UUID startupId, @NotNull UUID fence, long ttlMs, long safetyMarginMs) {
         if (!enforced) return;
         if (!startupId.equals(this.startupId) || !fence.equals(this.fence)) {
             close("ownership-token-mismatch");
@@ -56,7 +56,7 @@ public final class ServerOwnershipGate {
         this.open = true;
     }
 
-    public void close(@NotNull String reason) {
+    public synchronized void close(@NotNull String reason) {
         if (!enforced) return;
         this.open = false;
         this.deadlineNanos = 0L;
@@ -67,8 +67,17 @@ public final class ServerOwnershipGate {
         if (!enforced) return true;
         if (!open) return false;
         if (System.nanoTime() <= deadlineNanos) return true;
-        close("local-lease-deadline-expired");
-        return false;
+        synchronized (this) {
+            if (open && System.nanoTime() > deadlineNanos) close("local-lease-deadline-expired");
+            return open;
+        }
+    }
+
+    /** Capture one admitted identity before dispatching work to an asynchronous storage writer. */
+    public synchronized @Nullable OwnershipToken tokenFor(UUID instanceId) {
+        if (!enforced) return null;
+        if (!allowWrites()) throw new IllegalStateException("Datastore ownership unavailable: " + closeReason);
+        return new OwnershipToken(instanceId, startupId, fence);
     }
 
     public @NotNull String closeReason() {

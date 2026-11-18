@@ -40,25 +40,22 @@ public final class JdbcCheckCatalogPersistence implements CheckCatalogPersistenc
 
     @Override
     public Iterable<CheckCatalogRow> loadAll() {
-        List<CheckCatalogRow> out = new ArrayList<>();
-        try (Connection c = connections.open();
-             PreparedStatement ps = c.prepareStatement(
-                     "SELECT check_id, stable_key, display, description, introduced_version, introduced_at "
-                             + "FROM " + checksTable);
-             ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                long introducedAt = rs.getLong(6);
-                if (rs.wasNull()) introducedAt = 0L;
-                out.add(new CheckCatalogRow(
-                        rs.getInt(1),
-                        rs.getString(2),
-                        rs.getString(3),
-                        rs.getString(4),
-                        rs.getString(5),
-                        introducedAt));
-            }
+        try (Connection c = connections.open()) {
+            return readRows(c, checksTable);
         } catch (SQLException e) {
             throw new RuntimeException("failed to load " + checksTable, e);
+        }
+    }
+
+    public static List<CheckCatalogRow> readRows(Connection c, String checksTable) throws SQLException {
+        List<CheckCatalogRow> out = new ArrayList<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT check_id, stable_key, display, description, introduced_version, introduced_at FROM " + checksTable);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                out.add(new CheckCatalogRow(rs.getInt(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                        rs.getString(5), rs.getLong(6)));
+            }
         }
         return out;
     }

@@ -42,9 +42,9 @@ public record OwnershipClaimResult(
             @NotNull UUID startupId,
             @NotNull UUID fence,
             long dbNowEpochMs,
-            @NotNull ServerOwnershipSnapshot currentOwner) {
+            @Nullable ServerOwnershipSnapshot currentOwner) {
         return new OwnershipClaimResult(
                 false, persistentId, startupId, fence, dbNowEpochMs,
-                currentOwner.leaseExpiresAtEpochMs(), null, currentOwner);
+                currentOwner == null ? 0L : currentOwner.leaseExpiresAtEpochMs(), null, currentOwner);
     }
 }

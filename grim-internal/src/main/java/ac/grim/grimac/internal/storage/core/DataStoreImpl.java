@@ -10,6 +10,13 @@ import ac.grim.grimac.api.storage.category.Categories;
 import ac.grim.grimac.api.storage.category.Category;
 import ac.grim.grimac.api.storage.config.WritePathConfig;
 import ac.grim.grimac.api.storage.event.ViolationEvent;
+import ac.grim.grimac.api.storage.event.ServerStartupEvent;
+import ac.grim.grimac.api.storage.event.SessionEvent;
+import ac.grim.grimac.api.storage.model.SessionRecord;
+import ac.grim.grimac.api.storage.instance.OwnershipToken;
+import ac.grim.grimac.api.storage.model.ServerStartupRecord;
+import ac.grim.grimac.api.storage.registry.StoreId;
+import ac.grim.grimac.internal.storage.category.V2BuiltinKinds;
 import ac.grim.grimac.api.storage.kind.DataKind;
 import ac.grim.grimac.api.storage.kind.Operation;
 import ac.grim.grimac.api.storage.kind.ops.EntityOps;
@@ -82,6 +89,18 @@ public final class DataStoreImpl implements DataStore {
         return this;
     }
 
+    private @Nullable StartupStorage startupStorage;
+    private @Nullable UUID instanceId;
+
+    /** Bind all three physical stores before starting the rings. */
+    public DataStoreImpl withStartupStorage(StoreId ownershipStore, UUID persistentInstanceId) {
+        this.startupStorage = StartupStorage.resolve(v2Routes, ownershipStore);
+        this.instanceId = java.util.Objects.requireNonNull(persistentInstanceId);
+        return this;
+    }
+
+    public @Nullable StartupStorage startupStorage() { return startupStorage; }
+
     public V2Routes v2Routes() { return v2Routes; }
 
     public DataStoreImpl withOwnershipGate(@NotNull ServerOwnershipGate ownershipGate) {
@@ -135,7 +154,21 @@ public final class DataStoreImpl implements DataStore {
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <E> void registerRingFor(Category<E> cat) throws BackendException {
         V2Routes.Route<?> route = v2Routes.routeFor(cat);
-        if (route != null) {
+        if (route != null && cat == Categories.SERVER_STARTUP && startupStorage != null) {
+            rings.register(Categories.SERVER_STARTUP, route.backend(), (event, sequence, endOfBatch) -> {
+                OwnershipToken owner = event.admittedOwner();
+                if (owner == null && ownershipGate.enforced()) throw new BackendException("Missing startup admission token");
+                startupStorage.adapter().publishStartup(startupStorage.stores(), owner, V2BuiltinKinds.startupEventToRecord(event));
+            });
+        } else if (route != null && cat == Categories.SESSION && startupStorage != null) {
+            // Each session write checks its open startup in the same atomic operation as the write,
+            // so a buffered first insert cannot reopen history under a startup a peer already closed.
+            rings.register(Categories.SESSION, route.backend(), (event, sequence, endOfBatch) -> {
+                OwnershipToken owner = event.admittedOwner();
+                if (owner == null && ownershipGate.enforced()) throw new BackendException("Missing session admission token");
+                startupStorage.adapter().publishSession(startupStorage.stores(), owner, V2BuiltinKinds.sessionEventToRecord(event));
+            });
+        } else if (route != null) {
             rings.register(cat, route.backend(), (KindAdapter) route.adapter(),
                 route.storeId(), route.kind());
         } else {
@@ -147,7 +180,44 @@ public final class DataStoreImpl implements DataStore {
     @Override
     public <E> void submit(Category<E> cat, Consumer<E> configurer) {
         if (closed) return;
-        if (!ownershipGate.allowWrites()) return;
+        ServerOwnershipGate gate = ownershipGate;
+        if (!gate.allowWrites()) return;
+        if (cat == Categories.SERVER_STARTUP && (startupStorage != null || gate.enforced())) {
+            if (startupStorage == null) throw new IllegalStateException("Startup submission requires co-located ownership storage");
+            OwnershipToken owner;
+            try {
+                owner = gate.tokenFor(instanceId);
+            } catch (IllegalStateException expired) {
+                return; // The lease closed after allowWrites(); drop the write like any other closed-gate write.
+            }
+            rings.submit(cat, event -> {
+                try {
+                    configurer.accept(event);
+                } finally {
+                    ((ServerStartupEvent) event).admittedOwner(owner);
+                }
+            });
+            return;
+        }
+        if (cat == Categories.SESSION && gate.enforced() && startupStorage == null) {
+            return; // An enforced session write needs the fenced path. The raw ring writer would bypass it.
+        }
+        if (cat == Categories.SESSION && startupStorage != null && v2Routes.routeFor(cat) != null) {
+            OwnershipToken owner;
+            try {
+                owner = gate.tokenFor(instanceId);
+            } catch (IllegalStateException expired) {
+                return; // The lease closed after allowWrites(); drop the write like any other closed-gate write.
+            }
+            rings.submit(cat, event -> {
+                try {
+                    configurer.accept(event);
+                } finally {
+                    ((SessionEvent) event).admittedOwner(owner);
+                }
+            });
+            return;
+        }
         if (cat == Categories.VIOLATION) {
             submitViolation(configurer);
             return;
@@ -171,8 +241,9 @@ public final class DataStoreImpl implements DataStore {
             f.completeExceptionally(new IllegalStateException("DataStore is closed"));
             return f;
         }
+        ServerOwnershipGate admission = ownershipGate;
         boolean isReadShaped = isReadOperation(op);
-        if (!isReadShaped && !ownershipGate.allowWrites()) {
+        if (!isReadShaped && !admission.allowWrites()) {
             CompletableFuture<R> f = new CompletableFuture<>();
             f.completeExceptionally(new IllegalStateException(
                     "persistent writes are disabled: " + ownershipGate.closeReason()));
@@ -187,6 +258,20 @@ public final class DataStoreImpl implements DataStore {
                     + " — operation " + op.getClass().getSimpleName() + " cannot dispatch"));
             return f;
         }
+        boolean lifecycleMutation = !isReadShaped && (cat == Categories.SERVER_STARTUP
+                || op instanceof EntityOps.ReassignSessionOp
+                || cat == Categories.SESSION && op instanceof EntityOps.UpsertOp<?>
+                || op instanceof EntityOps.SetIfSentinelOp set
+                && cat == Categories.SESSION && "by_startup_open".equals(set.indexName()));
+        if (lifecycleMutation && startupStorage == null && admission.enforced()) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Startup mutation requires co-located ownership storage"));
+        }
+        OwnershipToken owner;
+        try {
+            owner = lifecycleMutation && startupStorage != null ? admission.tokenFor(instanceId) : null;
+        } catch (IllegalStateException e) {
+            return CompletableFuture.failedFuture(e);
+        }
         Executor executor = isReadShaped
                 ? reader
                 : rings.executorForBackendOperation(route.backend(), cat, reader);
@@ -194,6 +279,22 @@ public final class DataStoreImpl implements DataStore {
             long start = System.nanoTime();
             try {
                 if (!isReadShaped) requireWritesAllowed();
+                if (lifecycleMutation && startupStorage != null) {
+                    if (op instanceof EntityOps.UpsertOp<?> upsert && cat == Categories.SERVER_STARTUP
+                            && upsert.record() instanceof ServerStartupRecord row) {
+                        startupStorage.adapter().publishStartup(startupStorage.stores(), owner, row);
+                        return null;
+                    }
+                    if (op instanceof EntityOps.UpsertOp<?> upsert && cat == Categories.SESSION
+                            && upsert.record() instanceof SessionRecord row) {
+                        startupStorage.adapter().publishSession(startupStorage.stores(), owner, row);
+                        return null;
+                    }
+                    if (op instanceof EntityOps.ReassignSessionOp move && cat == Categories.SESSION) {
+                        return (R) Long.valueOf(startupStorage.adapter().reassignSession(startupStorage.stores(), owner, move));
+                    }
+                    if (admission.enforced()) throw new BackendException("Use the guarded startup close or repair operation");
+                }
                 KindAdapter adapter = route.adapter();
                 return (R) adapter.execute(route.storeId(), route.kind(), op);
             } catch (BackendException e) {

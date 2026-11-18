@@ -1,10 +1,17 @@
 package ac.grim.grimac.internal.storage.backend.mongo.v2;
 
+import ac.grim.grimac.api.storage.backend.BackendException;
 import ac.grim.grimac.api.storage.instance.OwnershipClaimResult;
+import ac.grim.grimac.api.storage.instance.OwnershipToken;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipMetadata;
+import ac.grim.grimac.api.storage.instance.StartupStores;
 import ac.grim.grimac.api.storage.registry.StoreId;
 import ac.grim.grimac.internal.storage.codec.bson.BsonBinaries;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.ReadPreference;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
@@ -12,6 +19,7 @@ import com.mongodb.client.model.ReturnDocument;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.Date;
 import java.util.UUID;
@@ -27,6 +35,7 @@ class MongoServerOwnershipAdapterTest {
     private final UUID persistent = UUID.randomUUID();
     private final UUID startup = UUID.randomUUID();
     private final UUID fence = UUID.randomUUID();
+    private final MongoClient client = mock(MongoClient.class);
     private final MongoDatabase db = mock(MongoDatabase.class);
     @SuppressWarnings("unchecked")
     private final MongoCollection<Document> collection = mock(MongoCollection.class);
@@ -37,7 +46,7 @@ class MongoServerOwnershipAdapterTest {
         when(db.getCollection(STORE.name())).thenReturn(collection);
         when(db.runCommand(any(Bson.class))).thenReturn(new Document("localTime", new Date(NOW)));
         when(collection.find(any(Bson.class))).thenReturn(read);
-        return new MongoServerOwnershipAdapter(db, Logger.getLogger(getClass().getName()));
+        return new MongoServerOwnershipAdapter(client, db, Logger.getLogger(getClass().getName()));
     }
 
     @Test
@@ -83,6 +92,45 @@ class MongoServerOwnershipAdapterTest {
         assertFalse(result.claimed());
         assertEquals(other, result.currentOwner().ownerStartupId());
         verify(collection, never()).insertOne(any(Document.class));
+    }
+
+    @Test
+    void recoveryComparesTheExpectedTokenAndServerClockAtTheWrite() throws Exception {
+        MongoServerOwnershipAdapter adapter = adapter();
+        OwnershipToken expected = new OwnershipToken(persistent, UUID.randomUUID(), UUID.randomUUID());
+        OwnershipToken candidate = new OwnershipToken(persistent, startup, fence);
+        when(db.runCommand(any(Bson.class), eq(ReadPreference.primary())))
+                .thenReturn(new Document("localTime", new Date(NOW)));
+        when(collection.withWriteConcern(WriteConcern.MAJORITY)).thenReturn(collection);
+        when(collection.withReadPreference(ReadPreference.primary())).thenReturn(collection);
+        UUID foreign = UUID.randomUUID();
+        when(read.first()).thenReturn(row(foreign, UUID.randomUUID(), NOW - 1));
+
+        var result = adapter.claimRecovery(STORE, candidate, expected, 20_000, metadata());
+
+        assertFalse(result.claimed());
+        assertEquals(foreign, result.currentOwner().ownerStartupId());
+        ArgumentCaptor<Bson> predicate = ArgumentCaptor.forClass(Bson.class);
+        verify(collection).findOneAndUpdate(predicate.capture(), any(Bson.class), any(FindOneAndUpdateOptions.class));
+        String filter = predicate.getValue().toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()).toJson();
+        assertTrue(filter.contains("owner_startup_id"));
+        assertTrue(filter.contains("fence"));
+        assertTrue(filter.contains("$$NOW"));
+        assertTrue(filter.contains(java.util.Base64.getEncoder()
+                .encodeToString(BsonBinaries.uuidBinary(expected.startupId()).getData())));
+        verify(collection, never()).insertOne(any(Document.class));
+    }
+
+    @Test
+    void standaloneRejectsMultiCollectionOperationsBeforeOpeningAClientSession() throws Exception {
+        MongoServerOwnershipAdapter adapter = adapter();
+        when(db.runCommand(any(Bson.class), eq(ReadPreference.primary())))
+                .thenReturn(new Document("maxWireVersion", 21).append("logicalSessionTimeoutMinutes", 30));
+        StartupStores stores = new StartupStores(STORE, StoreId.grim("startups"), StoreId.grim("sessions"));
+        var failure = assertThrows(BackendException.class, () -> adapter.closeStartup(stores, null, persistent, startup));
+        assertTrue(failure.getMessage().contains("replica set"));
+        verify(client, never()).startSession();
+        verifyNoInteractions(collection);
     }
 
     private Document row(UUID owner, UUID token, long expires) {

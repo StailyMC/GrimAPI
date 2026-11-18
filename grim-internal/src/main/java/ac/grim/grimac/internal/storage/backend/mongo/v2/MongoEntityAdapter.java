@@ -20,6 +20,7 @@ import ac.grim.grimac.internal.storage.codec.bson.BsonBinaries;
 import ac.grim.grimac.internal.storage.codec.bson.BsonCodec;
 import ac.grim.grimac.internal.storage.codec.bson.BsonCodecImpl;
 import ac.grim.grimac.internal.storage.codec.bson.BsonCodecs;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
@@ -424,93 +425,114 @@ public final class MongoEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
          * (matching the fast-path BsonCodecImpl.encode behaviour).
          */
         private void writePipeline(@NotNull Object record, @NotNull Object idValue) {
-            Document overwriteDoc = new Document();
-            Document mergeDoc = new Document();
-            // Stamp _v explicitly. The fast RawBsonDocument path gets
-            // this from BsonCodecImpl.encode; the pipeline path bypasses
-            // that, so without this every merge-path first-insert would
-            // produce a versionless doc.
-            overwriteDoc.append(BsonCodecImpl.VERSION_FIELD, codec.version());
-            int n = shape.fields().size();
-            for (int i = 0; i < n; i++) {
-                EncodeShape.FieldDef f = shape.fields().get(i);
-                Object raw = codec.readField(record, i);
-                Object bsonVal = toBsonValue(raw, f.javaType());
-                switch (f.mergeMode()) {
-                    case OVERWRITE -> {
-                        // Skip null-value nullable refs so wire format
-                        // matches the fast path (BsonCodecImpl.writeField
-                        // omits null nullables rather than writing
-                        // explicit BSON null). Primitive fields are
-                        // never null and always emit a literal.
-                        if (raw == null && f.nullable()) break;
-                        overwriteDoc.append(f.name(), literal(bsonVal));
-                    }
-                    case PRESERVE_ON_NON_NULL -> mergeDoc.append(f.name(),
-                        new Document("$ifNull", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
-                    case PRESERVE_ON_NON_SENTINEL -> {
-                        // Primitive-long preserve: existing wins UNLESS
-                        // existing is missing OR explicit null OR equals
-                        // the declared sentinel (e.g. SessionRecord's
-                        // OPEN=0L). The null branch matters because the
-                        // legacy MongoBackend writes/imports open
-                        // sessions as closed_at:null — without it, an
-                        // incoming close timestamp from the v2 path
-                        // would preserve null forever. $in over $type
-                        // covers missing + null in one operand.
-                        Document preserveSentinel = new Document("$cond", java.util.Arrays.asList(
-                            new Document("$or", java.util.Arrays.asList(
-                                new Document("$in", java.util.Arrays.asList(
-                                    new Document("$type", "$" + f.name()),
-                                    java.util.Arrays.asList("missing", "null"))),
-                                new Document("$eq", java.util.Arrays.asList(
-                                    "$" + f.name(), literal(f.sentinelValue()))))),
-                            literal(bsonVal),
-                            "$" + f.name()));
-                        mergeDoc.append(f.name(), preserveSentinel);
-                    }
-                    case INSERT_ONLY -> {
-                        // True insert-only: keep the existing field
-                        // value if the field EXISTS on the doc at all
-                        // (even if it's explicit null), else use the
-                        // incoming. $type returns "missing" only when
-                        // the field is absent. $ifNull would overwrite
-                        // an existing null on next upsert.
-                        Document insertOnly = new Document("$cond", java.util.Arrays.asList(
-                            new Document("$eq", java.util.Arrays.asList(
-                                new Document("$type", "$" + f.name()), "missing")),
-                            literal(bsonVal),
-                            "$" + f.name()));
-                        mergeDoc.append(f.name(), insertOnly);
-                    }
-                    case MAX -> mergeDoc.append(f.name(),
-                        new Document("$max", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
-                    case MIN -> mergeDoc.append(f.name(),
-                        new Document("$min", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
-                }
-            }
-            // Lower companions sit in the overwrite stage — they're
-            // derived columns refreshed on every write. Skip when the
-            // source field is null/non-String (consistent with the
-            // fast path).
-            for (LowerCompanion lc : lowerCompanions) {
-                Object raw = codec.readField(record, lc.fieldIndex);
-                if (raw instanceof String s) {
-                    overwriteDoc.append(lc.columnName, literal(s.toLowerCase(java.util.Locale.ROOT)));
-                }
-                // null source: skip entirely (matches fast path's
-                // writeNull-on-null-nullable; here we'd prefer absent).
-            }
-            List<Bson> pipeline = new ArrayList<>(2);
-            if (!overwriteDoc.isEmpty()) pipeline.add(new Document("$set", overwriteDoc));
-            if (!mergeDoc.isEmpty())     pipeline.add(new Document("$set", mergeDoc));
-            // updateOne(filter, pipeline, options) — Mongo 4.2+. Upsert
-            // on _id-filter auto-stamps _id on insert; no $setOnInsert.
             docColl.updateOne(
                 Filters.eq("_id", encodeIdValue(idValue)),
-                pipeline,
+                mergePipeline(codec, shape, lowerCompanions, record),
                 new UpdateOptions().upsert(true));
         }
+    }
+
+    /**
+     * Upserts with the entity's merge rules inside the caller's transaction. Used where an
+     * atomic precondition (such as an open startup) must commit together with the write.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static void upsertMerged(@NotNull MongoCollection<Document> coll, @NotNull ClientSession session,
+                             @NotNull Entity<?, ?, ?> kind, @NotNull Object record) {
+        if (!kind.recordType().isInstance(record)) {
+            throw new IllegalArgumentException("record type " + record.getClass().getName()
+                    + " does not match entity " + kind.recordType().getName());
+        }
+        Object idValue = ((Function) kind.idOf()).apply(record);
+        List<Bson> pipeline = mergePipeline(BsonCodecs.regular(kind.recordType()), kind.codec().shape(),
+                buildLowerCompanions(kind), record);
+        coll.updateOne(session, Filters.eq("_id", encodeIdValue(idValue)), pipeline, new UpdateOptions().upsert(true));
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static @NotNull List<Bson> mergePipeline(@NotNull BsonCodec codec, @NotNull EncodeShape shape,
+                                                     @NotNull LowerCompanion[] lowerCompanions, @NotNull Object record) {
+        Document overwriteDoc = new Document();
+        Document mergeDoc = new Document();
+        // Stamp _v explicitly. The fast RawBsonDocument path gets
+        // this from BsonCodecImpl.encode; the pipeline path bypasses
+        // that, so without this every merge-path first-insert would
+        // produce a versionless doc.
+        overwriteDoc.append(BsonCodecImpl.VERSION_FIELD, codec.version());
+        int n = shape.fields().size();
+        for (int i = 0; i < n; i++) {
+            EncodeShape.FieldDef f = shape.fields().get(i);
+            Object raw = codec.readField(record, i);
+            Object bsonVal = toBsonValue(raw, f.javaType());
+            switch (f.mergeMode()) {
+                case OVERWRITE -> {
+                    // Skip null-value nullable refs so wire format
+                    // matches the fast path (BsonCodecImpl.writeField
+                    // omits null nullables rather than writing
+                    // explicit BSON null). Primitive fields are
+                    // never null and always emit a literal.
+                    if (raw == null && f.nullable()) break;
+                    overwriteDoc.append(f.name(), literal(bsonVal));
+                }
+                case PRESERVE_ON_NON_NULL -> mergeDoc.append(f.name(),
+                    new Document("$ifNull", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
+                case PRESERVE_ON_NON_SENTINEL -> {
+                    // Primitive-long preserve: existing wins UNLESS
+                    // existing is missing OR explicit null OR equals
+                    // the declared sentinel (e.g. SessionRecord's
+                    // OPEN=0L). The null branch matters because the
+                    // legacy MongoBackend writes/imports open
+                    // sessions as closed_at:null — without it, an
+                    // incoming close timestamp from the v2 path
+                    // would preserve null forever. $in over $type
+                    // covers missing + null in one operand.
+                    Document preserveSentinel = new Document("$cond", java.util.Arrays.asList(
+                        new Document("$or", java.util.Arrays.asList(
+                            new Document("$in", java.util.Arrays.asList(
+                                new Document("$type", "$" + f.name()),
+                                java.util.Arrays.asList("missing", "null"))),
+                            new Document("$eq", java.util.Arrays.asList(
+                                "$" + f.name(), literal(f.sentinelValue()))))),
+                        literal(bsonVal),
+                        "$" + f.name()));
+                    mergeDoc.append(f.name(), preserveSentinel);
+                }
+                case INSERT_ONLY -> {
+                    // True insert-only: keep the existing field
+                    // value if the field EXISTS on the doc at all
+                    // (even if it's explicit null), else use the
+                    // incoming. $type returns "missing" only when
+                    // the field is absent. $ifNull would overwrite
+                    // an existing null on next upsert.
+                    Document insertOnly = new Document("$cond", java.util.Arrays.asList(
+                        new Document("$eq", java.util.Arrays.asList(
+                            new Document("$type", "$" + f.name()), "missing")),
+                        literal(bsonVal),
+                        "$" + f.name()));
+                    mergeDoc.append(f.name(), insertOnly);
+                }
+                case MAX -> mergeDoc.append(f.name(),
+                    new Document("$max", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
+                case MIN -> mergeDoc.append(f.name(),
+                    new Document("$min", java.util.Arrays.asList("$" + f.name(), literal(bsonVal))));
+            }
+        }
+        // Lower companions sit in the overwrite stage — they're
+        // derived columns refreshed on every write. Skip when the
+        // source field is null/non-String (consistent with the
+        // fast path).
+        for (LowerCompanion lc : lowerCompanions) {
+            Object raw = codec.readField(record, lc.fieldIndex);
+            if (raw instanceof String s) {
+                overwriteDoc.append(lc.columnName, literal(s.toLowerCase(java.util.Locale.ROOT)));
+            }
+            // null source: skip entirely (matches fast path's
+            // writeNull-on-null-nullable; here we'd prefer absent).
+        }
+        List<Bson> pipeline = new ArrayList<>(2);
+        if (!overwriteDoc.isEmpty()) pipeline.add(new Document("$set", overwriteDoc));
+        if (!mergeDoc.isEmpty())     pipeline.add(new Document("$set", mergeDoc));
+        return pipeline;
     }
 
     /**

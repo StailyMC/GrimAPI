@@ -1,5 +1,6 @@
 package ac.grim.grimac.api.storage.event;
 
+import ac.grim.grimac.api.storage.instance.OwnershipToken;
 import ac.grim.grimac.api.storage.model.ServerStartupRecord;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
@@ -66,7 +67,14 @@ public final class ServerStartupEvent {
         return this;
     }
 
+    // Admission identity travels with the ring slot and is never encoded in a startup row.
+    private @Nullable OwnershipToken admittedOwner;
+
+    @ApiStatus.Internal public @Nullable OwnershipToken admittedOwner() { return admittedOwner; }
+    @ApiStatus.Internal public void admittedOwner(@Nullable OwnershipToken owner) { admittedOwner = owner; }
+
     public void reset() {
+        admittedOwner = null;
         startupId = null;
         instanceId = null;
         serverName = null;

@@ -3,14 +3,21 @@ package ac.grim.grimac.internal.storage.backend.redis.v2;
 import ac.grim.grimac.api.storage.backend.BackendException;
 import ac.grim.grimac.api.storage.instance.OwnershipClaimResult;
 import ac.grim.grimac.api.storage.instance.OwnershipRenewResult;
+import ac.grim.grimac.api.storage.instance.OwnershipToken;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipAdapter;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipMetadata;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipSnapshot;
+import ac.grim.grimac.api.storage.instance.StartupStores;
+import ac.grim.grimac.api.storage.kind.ops.EntityOps;
+import ac.grim.grimac.api.storage.model.ServerStartupRecord;
+import ac.grim.grimac.api.storage.model.SessionRecord;
 import ac.grim.grimac.api.storage.registry.StoreId;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import redis.clients.jedis.JedisPool;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -33,8 +40,16 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
         local oldExpires = tonumber(redis.call('HGET', KEYS[1], 'lease_expires_at_ms') or '0')
         local owner = redis.call('HGET', KEYS[1], 'owner_startup_id')
         local fence = redis.call('HGET', KEYS[1], 'fence')
-        if not closed or tonumber(closed) ~= 0 or oldExpires <= now
-           or (owner == ARGV[2] and fence == ARGV[3]) then
+        local inactive = not closed or tonumber(closed) ~= 0 or oldExpires <= now
+        local allowed = inactive or (owner == ARGV[2] and fence == ARGV[3])
+        if ARGV[9] == 'absent' then
+          allowed = #previous == 0
+        elseif ARGV[9] == 'exact' then
+          allowed = #previous > 0 and inactive
+            and redis.call('HGET', KEYS[1], 'persistent_id') == ARGV[10]
+            and owner == ARGV[11] and fence == ARGV[12]
+        end
+        if allowed then
           redis.call('HSET', KEYS[1],
             'persistent_id', ARGV[1],
             'owner_startup_id', ARGV[2],
@@ -53,29 +68,36 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
         """;
 
     private static final String RENEW_SCRIPT = """
+        local clock = redis.call('TIME')
+        local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
         local owner = redis.call('HGET', KEYS[1], 'owner_startup_id')
         local fence = redis.call('HGET', KEYS[1], 'fence')
         local closed = tonumber(redis.call('HGET', KEYS[1], 'closed_at_ms') or '0')
         local expires = tonumber(redis.call('HGET', KEYS[1], 'lease_expires_at_ms') or '0')
-        if owner == ARGV[1] and fence == ARGV[2] and closed == 0 and expires > tonumber(ARGV[3]) then
+        if redis.call('HGET', KEYS[1], 'persistent_id') == ARGV[4]
+           and owner == ARGV[1] and fence == ARGV[2] and closed == 0 and expires > now then
+          local renewedUntil = now + tonumber(ARGV[3])
           redis.call('HSET', KEYS[1],
-            'lease_expires_at_ms', ARGV[4],
-            'last_renewed_at_ms', ARGV[3],
+            'lease_expires_at_ms', tostring(renewedUntil),
+            'last_renewed_at_ms', tostring(now),
             'closed_at_ms', '0')
           redis.call('HDEL', KEYS[1], 'close_reason')
-          return 1
+          return {1, tostring(now), tostring(renewedUntil)}
         end
-        return 0
+        return {0, tostring(now), '0'}
         """;
 
     private static final String CLOSE_SCRIPT = """
         local owner = redis.call('HGET', KEYS[1], 'owner_startup_id')
         local fence = redis.call('HGET', KEYS[1], 'fence')
         local closed = tonumber(redis.call('HGET', KEYS[1], 'closed_at_ms') or '0')
-        if owner == ARGV[1] and fence == ARGV[2] and closed == 0 then
+        if redis.call('HGET', KEYS[1], 'persistent_id') == ARGV[4]
+           and owner == ARGV[1] and fence == ARGV[2] and closed == 0 then
+          local clock = redis.call('TIME')
+          local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
           redis.call('HSET', KEYS[1],
-            'closed_at_ms', ARGV[3],
-            'close_reason', ARGV[4])
+            'closed_at_ms', tostring(now),
+            'close_reason', ARGV[3])
           return 1
         end
         return 0
@@ -83,6 +105,7 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
 
     private final @NotNull JedisPool pool;
     private final @NotNull String keyPrefix;
+    private final RedisStartupMutations startups;
     @SuppressWarnings("unused")
     private final @NotNull Logger logger;
 
@@ -93,6 +116,7 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
         this.pool = pool;
         this.keyPrefix = keyPrefix;
         this.logger = logger;
+        this.startups = new RedisStartupMutations(pool, keyPrefix);
     }
 
     @Override
@@ -121,20 +145,31 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
             @NotNull UUID fence,
             long ttlMs,
             @NotNull ServerOwnershipMetadata metadata) throws BackendException {
+        return claim(id, new OwnershipToken(persistentId, startupId, fence), ttlMs, metadata, List.of());
+    }
+
+    @Override
+    public OwnershipClaimResult claimRecovery(StoreId id, OwnershipToken candidate, @Nullable OwnershipToken expected,
+                                              long ttlMs, ServerOwnershipMetadata metadata) throws BackendException {
+        List<String> predecessor = expected == null ? List.of("absent")
+                : List.of("exact", expected.instanceId().toString(), expected.startupId().toString(), expected.fence().toString());
+        return claim(id, candidate, ttlMs, metadata, predecessor);
+    }
+
+    private OwnershipClaimResult claim(StoreId id, OwnershipToken candidate, long ttlMs, ServerOwnershipMetadata metadata,
+                                       List<String> predecessor) throws BackendException {
         try {
+            UUID persistentId = candidate.instanceId();
+            UUID startupId = candidate.startupId();
+            UUID fence = candidate.fence();
+            var args = new ArrayList<>(List.of(
+                    persistentId.toString(), startupId.toString(), fence.toString(), Long.toString(ttlMs),
+                    nullToEmpty(metadata.serverName()), nullToEmpty(metadata.hostname()),
+                    nullToEmpty(metadata.grimVersion()), nullToEmpty(metadata.serverVersionString())));
+            args.addAll(predecessor);
             Object result;
             try (var j = pool.getResource()) {
-                result = j.eval(CLAIM_SCRIPT,
-                        List.of(key(id, persistentId)),
-                        List.of(
-                                persistentId.toString(),
-                                startupId.toString(),
-                                fence.toString(),
-                                Long.toString(ttlMs),
-                                nullToEmpty(metadata.serverName()),
-                                nullToEmpty(metadata.hostname()),
-                                nullToEmpty(metadata.grimVersion()),
-                                nullToEmpty(metadata.serverVersionString())));
+                result = j.eval(CLAIM_SCRIPT, List.of(key(id, persistentId)), args);
             }
             if (!(result instanceof List<?> reply) || reply.size() != 4
                     || !(reply.get(3) instanceof List<?> fields) || fields.size() % 2 != 0) {
@@ -150,13 +185,40 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
                 return OwnershipClaimResult.claimed(
                         persistentId, startupId, fence, now, number(reply.get(2)), previous);
             }
-            if (number(reply.get(0)) != 0L || previous == null) {
-                throw new IllegalStateException("Redis rejected ownership claim without an owner");
+            if (number(reply.get(0)) != 0L) {
+                throw new IllegalStateException("invalid Redis ownership claim status");
             }
             return OwnershipClaimResult.denied(persistentId, startupId, fence, now, previous);
         } catch (RuntimeException e) {
             throw new BackendException("failed to claim Redis server ownership", e);
         }
+    }
+
+    @Override
+    public void publishStartup(StartupStores stores, @Nullable OwnershipToken owner, ServerStartupRecord row) throws BackendException {
+        startups.publish(stores, owner, row);
+    }
+
+    @Override
+    public long reassignSession(StartupStores stores, @Nullable OwnershipToken owner, EntityOps.ReassignSessionOp op)
+            throws BackendException {
+        return startups.reassign(stores, owner, op);
+    }
+
+    @Override
+    public void publishSession(StartupStores stores, @Nullable OwnershipToken owner, SessionRecord row) throws BackendException {
+        startups.publishSession(stores, owner, row);
+    }
+
+    @Override
+    public long closeStartup(StartupStores stores, @Nullable OwnershipToken owner, UUID instanceId, UUID startupId) throws BackendException {
+        return startups.close(stores, owner, instanceId, startupId, null);
+    }
+
+    @Override
+    public long repairStaleStartup(StartupStores stores, @Nullable OwnershipToken sweeper, UUID instanceId, UUID startupId,
+                                   long staleHeartbeatTtlMs) throws BackendException {
+        return startups.close(stores, sweeper, instanceId, startupId, staleHeartbeatTtlMs);
     }
 
     @Override
@@ -167,17 +229,18 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
             @NotNull UUID fence,
             long ttlMs) throws BackendException {
         try {
-            long now = dbNowEpochMs();
-            long expires = now + ttlMs;
             Object result;
             try (var j = pool.getResource()) {
                 result = j.eval(RENEW_SCRIPT,
                         List.of(key(id, persistentId)),
-                        List.of(startupId.toString(), fence.toString(),
-                                Long.toString(now), Long.toString(expires)));
+                        List.of(startupId.toString(), fence.toString(), Long.toString(ttlMs), persistentId.toString()));
             }
-            if (number(result) == 1L) {
-                return OwnershipRenewResult.renewed(persistentId, startupId, fence, now, expires);
+            if (!(result instanceof List<?> reply) || reply.size() != 3) {
+                throw new IllegalStateException("invalid Redis ownership renewal response");
+            }
+            long now = number(reply.get(1));
+            if (number(reply.get(0)) == 1L) {
+                return OwnershipRenewResult.renewed(persistentId, startupId, fence, now, number(reply.get(2)));
             }
             return OwnershipRenewResult.lost(persistentId, startupId, fence, now);
         } catch (RuntimeException e) {
@@ -193,12 +256,11 @@ public final class RedisServerOwnershipAdapter implements ServerOwnershipAdapter
             @NotNull UUID fence,
             @NotNull String reason) throws BackendException {
         try {
-            long now = dbNowEpochMs();
             Object result;
             try (var j = pool.getResource()) {
                 result = j.eval(CLOSE_SCRIPT,
                         List.of(key(id, persistentId)),
-                        List.of(startupId.toString(), fence.toString(), Long.toString(now), reason));
+                        List.of(startupId.toString(), fence.toString(), reason, persistentId.toString()));
             }
             return number(result) == 1L;
         } catch (RuntimeException e) {

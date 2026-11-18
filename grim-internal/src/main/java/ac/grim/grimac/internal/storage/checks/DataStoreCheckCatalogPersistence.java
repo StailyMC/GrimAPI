@@ -40,7 +40,15 @@ public final class DataStoreCheckCatalogPersistence implements CheckCatalogPersi
             @NotNull Logger logger) {
         this.store = store;
         this.logger = logger;
-        for (CheckCatalogRow row : initialRows) {
+        replaceCommitted(initialRows);
+    }
+
+    /** Install a successful out-of-band transaction's catalog without submitting duplicate writes. */
+    public synchronized void replaceCommitted(Iterable<CheckCatalogRow> rows) {
+        byId.clear();
+        byStableKey.clear();
+        nextCheckId = 1;
+        for (CheckCatalogRow row : rows) {
             putLocal(row);
             nextCheckId = Math.max(nextCheckId, row.checkId() + 1);
         }

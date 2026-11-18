@@ -3,13 +3,21 @@ package ac.grim.grimac.internal.storage.backend.mongo.v2;
 import ac.grim.grimac.api.storage.backend.BackendException;
 import ac.grim.grimac.api.storage.instance.OwnershipClaimResult;
 import ac.grim.grimac.api.storage.instance.OwnershipRenewResult;
+import ac.grim.grimac.api.storage.instance.OwnershipToken;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipAdapter;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipMetadata;
 import ac.grim.grimac.api.storage.instance.ServerOwnershipSnapshot;
+import ac.grim.grimac.api.storage.instance.StartupStores;
+import ac.grim.grimac.api.storage.kind.ops.EntityOps;
+import ac.grim.grimac.api.storage.model.ServerStartupRecord;
+import ac.grim.grimac.api.storage.model.SessionRecord;
 import ac.grim.grimac.api.storage.registry.StoreId;
 import ac.grim.grimac.internal.storage.codec.bson.BsonBinaries;
 import com.mongodb.MongoCommandException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.ReadPreference;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
@@ -21,8 +29,10 @@ import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.Date;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -38,10 +48,12 @@ public final class MongoServerOwnershipAdapter implements ServerOwnershipAdapter
 
     private final @NotNull MongoDatabase db;
     private final @NotNull Logger logger;
+    private final MongoStartupTransactions startupTransactions;
 
-    public MongoServerOwnershipAdapter(@NotNull MongoDatabase db, @NotNull Logger logger) {
+    public MongoServerOwnershipAdapter(@NotNull MongoClient client, @NotNull MongoDatabase db, @NotNull Logger logger) {
         this.db = db;
         this.logger = logger;
+        this.startupTransactions = new MongoStartupTransactions(client, db);
     }
 
     @Override
@@ -137,30 +149,73 @@ public final class MongoServerOwnershipAdapter implements ServerOwnershipAdapter
     }
 
     @Override
-    public @NotNull OwnershipRenewResult renewOwnership(
-            @NotNull StoreId id,
-            @NotNull UUID persistentId,
-            @NotNull UUID startupId,
-            @NotNull UUID fence,
-            long ttlMs) throws BackendException {
+    public OwnershipClaimResult claimRecovery(StoreId id, OwnershipToken candidate, @Nullable OwnershipToken expected,
+                                              long ttlMs, ServerOwnershipMetadata metadata) throws BackendException {
         try {
-            long now = dbNowEpochMs();
-            Bson filter = Filters.and(
-                    Filters.eq("_id", BsonBinaries.uuidBinary(persistentId)),
-                    Filters.eq("owner_startup_id", BsonBinaries.uuidBinary(startupId)),
-                    Filters.eq("fence", BsonBinaries.uuidBinary(fence)),
-                    Filters.eq("closed_at_ms", ServerOwnershipSnapshot.OPEN),
-                    Filters.gt("lease_expires_at_ms", now));
-            Bson update = Updates.combine(
-                    Updates.set("lease_expires_at_ms", now + ttlMs),
-                    Updates.set("last_renewed_at_ms", now),
-                    Updates.set("closed_at_ms", ServerOwnershipSnapshot.OPEN),
-                    Updates.unset("close_reason"));
-            long matched = collection(id).updateOne(filter, update).getMatchedCount();
-            if (matched == 1) {
-                return OwnershipRenewResult.renewed(persistentId, startupId, fence, now, now + ttlMs);
+            if (ttlMs <= 0) throw new BackendException("Mongo recovery claim requires a positive TTL");
+            // Timestamp the grant conservatively; the predecessor filter uses the server clock at the write.
+            Date dbTime = db.runCommand(new Document("hello", 1), ReadPreference.primary()).getDate("localTime");
+            if (dbTime == null) throw new BackendException("Mongo recovery claim requires hello.localTime");
+            long now = dbTime.getTime();
+            long expires = Math.addExact(now, ttlMs);
+            UUID instance = candidate.instanceId();
+            UUID startup = candidate.startupId();
+            UUID fence = candidate.fence();
+            var rows = collection(id).withWriteConcern(WriteConcern.MAJORITY)
+                    .withReadPreference(ReadPreference.primary());
+            if (expected == null) {
+                try {
+                    rows.insertOne(ownershipDocument(instance, startup, fence, now, expires, metadata));
+                    return OwnershipClaimResult.claimed(instance, startup, fence, now, expires, null);
+                } catch (MongoWriteException e) {
+                    if (e.getError().getCode() != DUPLICATE_KEY) throw e;
+                }
+            } else if (instance.equals(expected.instanceId())) {
+                Bson inactive = Filters.or(
+                        Filters.and(Filters.type("closed_at_ms", "number"),
+                                Filters.ne("closed_at_ms", ServerOwnershipSnapshot.OPEN)),
+                        Filters.and(Filters.type("lease_expires_at_ms", "number"),
+                                Filters.expr(new Document("$lte", List.of("$lease_expires_at_ms", databaseMillis())))));
+                Bson update = Updates.combine(
+                        Updates.set("owner_startup_id", BsonBinaries.uuidBinary(startup)),
+                        Updates.set("fence", BsonBinaries.uuidBinary(fence)),
+                        Updates.set("lease_expires_at_ms", expires),
+                        Updates.set("last_renewed_at_ms", now),
+                        Updates.set("closed_at_ms", ServerOwnershipSnapshot.OPEN),
+                        Updates.unset("close_reason"),
+                        Updates.set("server_name", metadata.serverName()),
+                        Updates.set("hostname", metadata.hostname()),
+                        Updates.set("grim_version", metadata.grimVersion()),
+                        Updates.set("server_version", metadata.serverVersionString()));
+                Document before = rows.findOneAndUpdate(Filters.and(exactToken(expected), inactive), update,
+                        new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE));
+                if (before != null) {
+                    return OwnershipClaimResult.claimed(instance, startup, fence, now, expires, snapshot(before));
+                }
             }
-            return OwnershipRenewResult.lost(persistentId, startupId, fence, now);
+            Document current = rows.find(Filters.eq("_id", BsonBinaries.uuidBinary(instance))).first();
+            return OwnershipClaimResult.denied(instance, startup, fence, now, current == null ? null : snapshot(current));
+        } catch (RuntimeException e) {
+            throw new BackendException("failed to claim Mongo recovery ownership", e);
+        }
+    }
+
+    @Override
+    public @NotNull OwnershipRenewResult renewOwnership(
+            @NotNull StoreId id, @NotNull UUID persistentId, @NotNull UUID startupId,
+            @NotNull UUID fence, long ttlMs) throws BackendException {
+        try {
+            Bson filter = liveToken(new OwnershipToken(persistentId, startupId, fence));
+            Document renewed = collection(id).findOneAndUpdate(filter,
+                    List.of(new Document("$set", new Document("last_renewed_at_ms", databaseMillis())
+                            .append("lease_expires_at_ms", new Document("$add", List.of(databaseMillis(), ttlMs)))),
+                            new Document("$unset", "close_reason")),
+                    new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+            if (renewed != null) {
+                return OwnershipRenewResult.renewed(persistentId, startupId, fence,
+                        longValue(renewed, "last_renewed_at_ms"), longValue(renewed, "lease_expires_at_ms"));
+            }
+            return OwnershipRenewResult.lost(persistentId, startupId, fence, dbNowEpochMs());
         } catch (RuntimeException e) {
             throw new BackendException("failed to renew Mongo server ownership", e);
         }
@@ -168,25 +223,75 @@ public final class MongoServerOwnershipAdapter implements ServerOwnershipAdapter
 
     @Override
     public boolean closeOwnership(
-            @NotNull StoreId id,
-            @NotNull UUID persistentId,
-            @NotNull UUID startupId,
-            @NotNull UUID fence,
-            @NotNull String reason) throws BackendException {
+            @NotNull StoreId id, @NotNull UUID persistentId, @NotNull UUID startupId,
+            @NotNull UUID fence, @NotNull String reason) throws BackendException {
         try {
-            long now = dbNowEpochMs();
-            Bson filter = Filters.and(
-                    Filters.eq("_id", BsonBinaries.uuidBinary(persistentId)),
-                    Filters.eq("owner_startup_id", BsonBinaries.uuidBinary(startupId)),
-                    Filters.eq("fence", BsonBinaries.uuidBinary(fence)),
+            Bson filter = Filters.and(exactToken(new OwnershipToken(persistentId, startupId, fence)),
                     Filters.eq("closed_at_ms", ServerOwnershipSnapshot.OPEN));
-            Bson update = Updates.combine(
-                    Updates.set("closed_at_ms", now),
-                    Updates.set("close_reason", reason));
-            return collection(id).updateOne(filter, update).getMatchedCount() == 1;
+            Bson update = new Document("$set", new Document("closed_at_ms", databaseMillis())
+                    .append("close_reason", new Document("$literal", reason)));
+            return collection(id).updateOne(filter, List.of(update)).getMatchedCount() == 1;
         } catch (RuntimeException e) {
             throw new BackendException("failed to close Mongo server ownership", e);
         }
+    }
+
+    /** Preflight for callers routing the three stores to this Mongo v2 backend. */
+    public void requireStartupTransactions() throws BackendException {
+        startupTransactions.requireStartupTransactions();
+    }
+
+    @Override
+    public void requireAtomicStartupOperations() throws BackendException {
+        requireStartupTransactions();
+    }
+
+    @Override
+    public void publishStartup(StartupStores stores, @Nullable OwnershipToken owner, ServerStartupRecord row)
+            throws BackendException {
+        startupTransactions.publish(stores, owner, row);
+    }
+
+    @Override
+    public long reassignSession(StartupStores stores, @Nullable OwnershipToken owner, EntityOps.ReassignSessionOp op)
+            throws BackendException {
+        return startupTransactions.reassign(stores, owner, op);
+    }
+
+    @Override
+    public void publishSession(StartupStores stores, @Nullable OwnershipToken owner, SessionRecord row)
+            throws BackendException {
+        startupTransactions.publishSession(stores, owner, row);
+    }
+
+    @Override
+    public long closeStartup(StartupStores stores, @Nullable OwnershipToken owner, UUID instanceId, UUID startupId)
+            throws BackendException {
+        return startupTransactions.close(stores, owner, instanceId, startupId);
+    }
+
+    @Override
+    public long repairStaleStartup(StartupStores stores, @Nullable OwnershipToken sweeper, UUID targetInstanceId,
+                                   UUID targetStartupId, long staleHeartbeatTtlMs) throws BackendException {
+        return startupTransactions.repair(stores, sweeper, targetInstanceId, targetStartupId, staleHeartbeatTtlMs);
+    }
+
+    private static Bson exactToken(OwnershipToken token) {
+        return Filters.and(
+                Filters.eq("_id", BsonBinaries.uuidBinary(token.instanceId())),
+                Filters.eq("owner_startup_id", BsonBinaries.uuidBinary(token.startupId())),
+                Filters.eq("fence", BsonBinaries.uuidBinary(token.fence())));
+    }
+
+    static Bson liveToken(OwnershipToken token) {
+        return Filters.and(exactToken(token),
+                Filters.eq("closed_at_ms", ServerOwnershipSnapshot.OPEN),
+                Filters.type("lease_expires_at_ms", "number"),
+                Filters.expr(new Document("$gt", List.of("$lease_expires_at_ms", databaseMillis()))));
+    }
+
+    static Document databaseMillis() {
+        return new Document("$toLong", "$$NOW");
     }
 
     @Override

@@ -418,8 +418,18 @@ public final class SqlEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
     }
 
     private @NotNull String legacyInsertSql(@NotNull String tableName, @NotNull EncodeShape shape) {
+        return legacyInsertSql(dialect, tableName, shape);
+    }
+
+    private static @NotNull String legacyInsertSql(@NotNull SqlDialect dialect, @NotNull String tableName,
+                                                   @NotNull EncodeShape shape) {
+        return insertSql("INSERT OR IGNORE INTO ", dialect, tableName, shape);
+    }
+
+    private static @NotNull String insertSql(@NotNull String verb, @NotNull SqlDialect dialect, @NotNull String tableName,
+                                             @NotNull EncodeShape shape) {
         StringBuilder sb = new StringBuilder();
-        sb.append("INSERT OR IGNORE INTO ").append(dialect.quoteIdentifier(tableName)).append(" (");
+        sb.append(verb).append(dialect.quoteIdentifier(tableName)).append(" (");
         boolean first = true;
         for (EncodeShape.FieldDef f : shape.fields()) {
             if (!first) sb.append(", ");
@@ -435,7 +445,7 @@ public final class SqlEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
         return sb.toString();
     }
 
-    private @NotNull List<Integer> legacyUpdateIndexes(@NotNull EncodeShape shape) {
+    private static @NotNull List<Integer> legacyUpdateIndexes(@NotNull EncodeShape shape) {
         List<Integer> indexes = new ArrayList<>();
         for (int i = 0; i < shape.fields().size(); i++) {
             EncodeShape.FieldDef f = shape.fields().get(i);
@@ -447,6 +457,14 @@ public final class SqlEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
     }
 
     private @NotNull String legacyUpdateSql(
+            @NotNull String tableName,
+            @NotNull EncodeShape shape,
+            @NotNull List<Integer> updateIndexes) {
+        return legacyUpdateSql(dialect, tableName, shape, updateIndexes);
+    }
+
+    private static @NotNull String legacyUpdateSql(
+            @NotNull SqlDialect dialect,
             @NotNull String tableName,
             @NotNull EncodeShape shape,
             @NotNull List<Integer> updateIndexes) {
@@ -563,6 +581,50 @@ public final class SqlEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
             } finally {
                 c.setAutoCommit(priorAutoCommit);
             }
+        }
+    }
+
+    /** Inserts a row that must be absent. A concurrent insert of the same ID fails with a unique violation. */
+    @SuppressWarnings({"rawtypes"})
+    static void insertOn(@NotNull Connection c, @NotNull SqlDialect dialect, @NotNull String tableName,
+                         @NotNull Entity<?, ?, ?> kind, @NotNull Object record) throws SQLException {
+        if (!kind.recordType().isInstance(record)) {
+            throw new IllegalArgumentException("record type " + record.getClass().getName()
+                    + " does not match entity " + kind.recordType().getName());
+        }
+        EncodeShape shape = kind.codec().shape();
+        try (PreparedStatement ps = c.prepareStatement(insertSql("INSERT INTO ", dialect, tableName, shape))) {
+            bindRecordFields(ps, shape, BsonCodecs.regular(kind.recordType()), record);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Applies the entity's normal upsert merge on a connection whose transaction the caller owns. */
+    @SuppressWarnings({"rawtypes"})
+    static void upsertOn(@NotNull Connection c, @NotNull SqlDialect dialect, @NotNull String tableName,
+                         @NotNull Entity<?, ?, ?> kind, @NotNull Object record) throws SQLException {
+        if (!kind.recordType().isInstance(record)) {
+            throw new IllegalArgumentException("record type " + record.getClass().getName()
+                    + " does not match entity " + kind.recordType().getName());
+        }
+        EncodeShape shape = kind.codec().shape();
+        BsonCodec codec = BsonCodecs.regular(kind.recordType());
+        if (!dialect.usesLegacySqliteUpsert()) {
+            try (PreparedStatement ps = c.prepareStatement(dialect.upsertSql(tableName, shape))) {
+                bindRecordFields(ps, shape, codec, record);
+                ps.executeUpdate();
+            }
+            return;
+        }
+        try (PreparedStatement insert = c.prepareStatement(legacyInsertSql(dialect, tableName, shape))) {
+            bindRecordFields(insert, shape, codec, record);
+            insert.executeUpdate();
+        }
+        List<Integer> updateIndexes = legacyUpdateIndexes(shape);
+        if (updateIndexes.isEmpty()) return;
+        try (PreparedStatement update = c.prepareStatement(legacyUpdateSql(dialect, tableName, shape, updateIndexes))) {
+            bindLegacyUpdate(update, shape, codec, record, updateIndexes, idFieldIndex(shape));
+            update.executeUpdate();
         }
     }
 
@@ -756,16 +818,23 @@ public final class SqlEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
     }
 
     private long reassignSession(StoreId id, Entity<?, ?, ?> kind, EntityOps.ReassignSessionOp op) throws SQLException {
+        try (Connection c = ds.getConnection()) {
+            return reassignSession(c, dialect, dialect.quoteIdentifier(id.name()), kind, op);
+        }
+    }
+
+    static long reassignSession(Connection c, SqlDialect dialect, String quotedTable, Entity<?, ?, ?> kind,
+                                EntityOps.ReassignSessionOp op) throws SQLException {
         if (kind.recordType() != ac.grim.grimac.api.storage.model.SessionRecord.class) {
             throw new IllegalArgumentException("session reassignment requires the session entity");
         }
         EncodeShape shape = kind.codec().shape();
         String owner = dialect.quoteIdentifier("startup_id");
-        String sql = "UPDATE " + dialect.quoteIdentifier(id.name()) + " SET " + owner + " = ?, "
+        String sql = "UPDATE " + quotedTable + " SET " + owner + " = ?, "
                 + dialect.quoteIdentifier("closed_at") + " = 0 WHERE " + dialect.quoteIdentifier(shape.idField())
                 + " = ? AND " + owner + " <> ? AND " + owner + " IN ("
                 + String.join(",", java.util.Collections.nCopies(op.previousStartups().size(), "?")) + ")";
-        try (Connection c = ds.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
             SqlBindings.bind(ps, 1, fieldDef(shape, "startup_id"), op.startupId());
             SqlBindings.bind(ps, 2, idFieldDef(shape), op.sessionId());
             SqlBindings.bind(ps, 3, fieldDef(shape, "startup_id"), op.startupId());

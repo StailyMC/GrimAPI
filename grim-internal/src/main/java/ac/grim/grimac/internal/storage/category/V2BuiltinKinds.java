@@ -127,7 +127,7 @@ public final class V2BuiltinKinds {
      * is the {@link SessionRecord#OPEN} sentinel — heartbeats leave it at 0,
      * graceful close stamps a real timestamp.
      */
-    static @NotNull SessionRecord sessionEventToRecord(@NotNull SessionEvent e) {
+    public static @NotNull SessionRecord sessionEventToRecord(@NotNull SessionEvent e) {
         return new SessionRecord(
             e.sessionId(),
             e.playerUuid(),
@@ -371,7 +371,7 @@ public final class V2BuiltinKinds {
             e.drainMode());
     }
 
-    static @NotNull ServerStartupRecord startupEventToRecord(@NotNull ServerStartupEvent e) {
+    public static @NotNull ServerStartupRecord startupEventToRecord(@NotNull ServerStartupEvent e) {
         UUID startupId = e.startupId();
         UUID instanceId = e.instanceId();
         String name = e.serverName();

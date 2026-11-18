@@ -10,6 +10,8 @@ import ac.grim.grimac.api.storage.kind.Entity;
 import ac.grim.grimac.api.storage.kind.IndexSpec;
 import ac.grim.grimac.api.storage.kind.Operation;
 import ac.grim.grimac.api.storage.kind.ops.EntityOps;
+import ac.grim.grimac.api.storage.model.ServerStartupRecord;
+import ac.grim.grimac.api.storage.model.SessionRecord;
 import ac.grim.grimac.api.storage.query.Cursor;
 import ac.grim.grimac.api.storage.query.Page;
 import ac.grim.grimac.api.storage.registry.Migration;
@@ -18,6 +20,7 @@ import ac.grim.grimac.internal.storage.codec.bson.BsonCodec;
 import ac.grim.grimac.internal.storage.codec.bson.BsonCodecs;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
+import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
 import java.util.*;
@@ -55,8 +58,11 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
     public void ensureStore(@NotNull StoreId id, @NotNull Entity<?, ?, ?> kind) throws BackendException {
         if (kind.secondaryIndexes().isEmpty()) return;
         String storePrefix = keyPrefix + id.name() + ":";
+        boolean lifecycleIndex = kind.recordType() == SessionRecord.class || kind.recordType() == ServerStartupRecord.class;
         try (var j = pool.getResource()) {
-            deleteIndexKeys(j, storePrefix);
+            // Startup close uses the open-session index in its atomic decision. Never leave
+            // that index temporarily empty while another process initializes its routes.
+            if (!lifecycleIndex) deleteIndexKeys(j, storePrefix);
 
             BsonCodec codec = BsonCodecs.regular(kind.recordType());
             EncodeShape shape = kind.codec().shape();
@@ -68,6 +74,11 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
                 redis.clients.jedis.resps.ScanResult<String> result = j.scan(cursor, params);
                 for (String key : result.getResult()) {
                     if (key.startsWith(storePrefix + "__idx:")) continue;
+                    if (lifecycleIndex) {
+                        mutateAtomically(j, storePrefix, kind, key.substring(storePrefix.length()),
+                                existing -> existing.isEmpty() ? null : existing);
+                        continue;
+                    }
                     Map<byte[], byte[]> hash = j.hgetAll(bytes(key));
                     if (hash == null || hash.isEmpty()) continue;
                     Object record = decodeHash(kind, hash);
@@ -138,18 +149,22 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
         BsonCodec codec = BsonCodecs.regular(kind.recordType());
         EncodeShape shape = kind.codec().shape();
         Object idVal = codec.readField(record, idFieldIndex(shape));
-        String redisKey = storePrefix + RedisKeys.encode(idVal);
-        mutateAtomically(storePrefix, kind, RedisKeys.encode(idVal), existing -> {
-            Map<byte[], byte[]> merged = new LinkedHashMap<>(existing);
-            for (int i = 0; i < shape.fields().size(); i++) {
-                EncodeShape.FieldDef field = shape.fields().get(i);
-                Object incoming = codec.readField(record, i);
-                byte[] old = hashGet(existing, field.name());
-                Object value = mergeField(field, old, incoming);
-                putField(merged, field.name(), value == null ? null : fieldValueBytes(field, value));
-            }
-            return merged;
-        });
+        mutateAtomically(storePrefix, kind, RedisKeys.encode(idVal), existing -> mergeHash(kind, existing, record));
+    }
+
+    /** The stored hash after an upsert of record with the entity's merge rules. */
+    static Map<byte[], byte[]> mergeHash(Entity<?, ?, ?> kind, Map<byte[], byte[]> existing, Object record) {
+        BsonCodec codec = BsonCodecs.regular(kind.recordType());
+        EncodeShape shape = kind.codec().shape();
+        Map<byte[], byte[]> merged = new LinkedHashMap<>(existing);
+        for (int i = 0; i < shape.fields().size(); i++) {
+            EncodeShape.FieldDef field = shape.fields().get(i);
+            Object incoming = codec.readField(record, i);
+            byte[] old = hashGet(existing, field.name());
+            Object value = mergeField(field, old, incoming);
+            putField(merged, field.name(), value == null ? null : fieldValueBytes(field, value));
+        }
+        return merged;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -234,7 +249,7 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
     }
 
     private long reassignSession(String prefix, Entity<?, ?, ?> kind, EntityOps.ReassignSessionOp op) {
-        if (kind.recordType() != ac.grim.grimac.api.storage.model.SessionRecord.class) {
+        if (kind.recordType() != SessionRecord.class) {
             throw new IllegalArgumentException("session reassignment requires the session entity");
         }
         return mutateAtomically(prefix, kind, RedisKeys.encode(op.sessionId()), existing -> {
@@ -285,9 +300,9 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
         return changed;
     }
 
-    private record IndexEntry(String key, double score, String member) {}
+    record IndexEntry(String key, double score, String member) {}
 
-    private List<IndexEntry> indexEntries(String prefix, Entity<?, ?, ?> kind, Map<byte[], byte[]> hash) {
+    static List<IndexEntry> indexEntries(String prefix, Entity<?, ?, ?> kind, Map<byte[], byte[]> hash) {
         if (hash.isEmpty()) return List.of();
         EncodeShape shape = kind.codec().shape();
         BsonCodec codec = BsonCodecs.regular(kind.recordType());
@@ -306,26 +321,33 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
 
     private long mutateAtomically(String prefix, Entity<?, ?, ?> kind, String id,
             java.util.function.Function<Map<byte[], byte[]>, Map<byte[], byte[]>> update) {
-        byte[] key = bytes(prefix + id);
         try (var j = pool.getResource()) {
-            for (int attempt = 0; attempt < 32; attempt++) {
-                j.watch(key);
-                try {
-                    Map<byte[], byte[]> existing = j.hgetAll(key);
-                    Map<byte[], byte[]> next = update.apply(existing);
-                    if (next == null) return 0L;
-                    List<IndexEntry> before = indexEntries(prefix, kind, existing);
-                    List<IndexEntry> after = indexEntries(prefix, kind, next);
-                    try (var tx = j.multi()) {
-                        for (IndexEntry index : before) tx.zrem(index.key(), index.member());
+            return mutateAtomically(j, prefix, kind, id, update);
+        }
+    }
+
+    private long mutateAtomically(Jedis j, String prefix, Entity<?, ?, ?> kind, String id,
+            java.util.function.Function<Map<byte[], byte[]>, Map<byte[], byte[]>> update) {
+        byte[] key = bytes(prefix + id);
+        for (int attempt = 0; attempt < 32; attempt++) {
+            j.watch(key);
+            try {
+                Map<byte[], byte[]> existing = j.hgetAll(key);
+                Map<byte[], byte[]> next = update.apply(existing);
+                if (next == null) return 0L;
+                List<IndexEntry> before = next == existing ? List.of() : indexEntries(prefix, kind, existing);
+                List<IndexEntry> after = indexEntries(prefix, kind, next);
+                try (var tx = j.multi()) {
+                    for (IndexEntry index : before) tx.zrem(index.key(), index.member());
+                    if (next != existing) {
                         tx.del(key);
                         tx.hset(key, next);
-                        for (IndexEntry index : after) tx.zadd(index.key(), index.score(), index.member());
-                        if (tx.exec() != null) return 1L;
                     }
-                } finally {
-                    j.unwatch();
+                    for (IndexEntry index : after) tx.zadd(index.key(), index.score(), index.member());
+                    if (tx.exec() != null) return 1L;
                 }
+            } finally {
+                j.unwatch();
             }
         }
         throw new IllegalStateException("Redis entity write conflicted repeatedly");
@@ -430,7 +452,7 @@ public final class RedisEntityAdapter implements KindAdapter<Entity<?, ?, ?>> {
         }
     }
 
-    private Object decodeHash(Entity<?, ?, ?> kind, Map<byte[], byte[]> hash) {
+    private static Object decodeHash(Entity<?, ?, ?> kind, Map<byte[], byte[]> hash) {
         BsonCodec codec = BsonCodecs.regular(kind.recordType());
         EncodeShape shape = kind.codec().shape();
         Object[] args = new Object[shape.fields().size()];

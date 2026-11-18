@@ -96,7 +96,7 @@ public final class MongoBackendV2 implements BackendV2 {
             this.kvScopedAdapter = new MongoKeyValueScopedAdapter(db, logger);
             this.entityAdapter = new MongoEntityAdapter(db, logger);
             this.counterAdapter = new MongoCounterAdapter(db, logger);
-            this.ownershipAdapter = new MongoServerOwnershipAdapter(db, logger);
+            this.ownershipAdapter = new MongoServerOwnershipAdapter(client, db, logger);
             // Future: Blob adapter wired here (Phase 6).
         } catch (RuntimeException e) {
             throw new BackendException("failed to initialise Mongo backend v2", e);
